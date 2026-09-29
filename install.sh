@@ -9,6 +9,7 @@ PLUGIN_NAME="keep-awake"
 PLUGIN_FILE="$PLUGIN_NAME.10s.sh"
 SUDOERS_FILE="/etc/sudoers.d/keep-awake"
 SWIFTBAR_ID="com.ameba.SwiftBar"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
 # Not ~/Library/Application Support/SwiftBar/Plugins: SwiftBar keeps its own per-plugin data there.
 DEFAULT_PLUGIN_DIR="$HOME/.swiftbar"
 
@@ -38,6 +39,44 @@ find_brew() {
 
 swiftbar_running() { /usr/bin/pgrep -x SwiftBar >/dev/null; }
 
+ask() {
+    local answer
+    read -r -p "$1 [y/N] " answer </dev/tty
+    case "$answer" in
+        [yY] | [yY][eE][sS]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+find_jq() {
+    if command -v jq >/dev/null 2>&1; then
+        command -v jq
+    elif [ -x /usr/bin/jq ]; then
+        echo /usr/bin/jq
+    fi
+}
+
+# The hooks for Auto mode, as a settings.json "hooks" object. $1 is the installed plugin.
+claude_hooks_json() {
+    local hold release
+    hold=$(printf '"%s" claude-hold' "$1")
+    release=$(printf '"%s" claude-release' "$1")
+    "$jq" -n --arg hold "$hold" --arg release "$release" '
+        def run($cmd): [{hooks: [{type: "command", command: $cmd, timeout: 10}]}];
+        {
+            UserPromptSubmit: run($hold),
+            PreToolUse: run($hold),
+            PostToolUse: run($hold),
+            Stop: run($release),
+            StopFailure: run($release),
+            SessionEnd: run($release),
+            Notification: [{
+                matcher: "idle_prompt",
+                hooks: [{type: "command", command: $release, timeout: 10}]
+            }]
+        }'
+}
+
 [ "$(uname -s)" = Darwin ] || die "Keep Awake only works on macOS."
 [ "$EUID" -ne 0 ] || die "Run this as your normal user, without sudo. It asks for your password when it needs it."
 macos_major=$(sw_vers -productVersion | cut -d. -f1)
@@ -53,6 +92,9 @@ This script will:
   2. Put the Keep Awake plugin in SwiftBar's plugin folder
   3. Add a sudo rule that lets you run exactly those two pmset commands
      without a password: /etc/sudoers.d/keep-awake
+  4. If you use Claude Code, and only if you say yes: add hooks to
+     ~/.claude/settings.json for Auto mode, which keeps the Mac awake
+     only while Claude is working
 
 WARNING: while Keep Awake is ON, your Mac does not sleep, even with the lid closed.
 A closed laptop in a bag or sleeve can get very hot and drain its battery.
@@ -60,11 +102,7 @@ Turn it off before you pack the Mac away.
 
 EOF
 { : </dev/tty; } 2>/dev/null || die "No terminal to read your answer from. Run this from Terminal."
-read -r -p "Continue? [y/N] " answer </dev/tty
-case "$answer" in
-    [yY] | [yY][eE][sS]) ;;
-    *) echo "Nothing installed."; exit 0 ;;
-esac
+ask "Continue?" || { echo "Nothing installed."; exit 0; }
 
 work_dir=$(mktemp -d)
 trap 'rm -rf "$work_dir"' EXIT
@@ -132,7 +170,39 @@ sudo -n /usr/bin/pmset -a disablesleep "${current:-0}" 2>/dev/null ||
     die "The sudo rule was added but is not active. Check that /etc/sudoers contains '#includedir /private/etc/sudoers.d'."
 say "sudo rule works"
 
-# 4. Start SwiftBar or reload its plugins
+# 4. Claude Code hooks for Auto mode
+if [ -d "$HOME/.claude" ] || command -v claude >/dev/null 2>&1; then
+    echo
+    echo "Auto mode keeps your Mac awake while Claude Code is working and lets it sleep"
+    echo "when Claude is done or waiting for you. It needs hooks in $CLAUDE_SETTINGS."
+    if ask "Add the Claude Code hooks?"; then
+        jq=$(find_jq)
+        if [ -z "$jq" ]; then
+            say "Skipping the hooks: they need jq, which comes with macOS 15 and later. Run 'brew install jq', then install.sh again."
+        else
+            mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+            [ -s "$CLAUDE_SETTINGS" ] || echo '{}' >"$CLAUDE_SETTINGS"
+            cp "$CLAUDE_SETTINGS" "$CLAUDE_SETTINGS.keep-awake-backup"
+            # Drops earlier Keep Awake hooks first, so running install.sh again doesn't add them twice.
+            if "$jq" --argjson ours "$(claude_hooks_json "$plugin_dir/$PLUGIN_FILE")" '
+                (.hooks // {}) as $hooks
+                | .hooks = ($hooks
+                    | map_values(map(.hooks |= map(select(.command // "" | contains("keep-awake.10s.sh") | not)))
+                        | map(select(.hooks | length > 0)))
+                    | with_entries(select(.value | length > 0)))
+                | reduce ($ours | to_entries[]) as $e (.; .hooks[$e.key] += $e.value)
+            ' "$CLAUDE_SETTINGS" >"$work_dir/settings.json"; then
+                # cat, not mv: keeps the file's permissions, and a symlink to a dotfiles repo stays a symlink.
+                cat "$work_dir/settings.json" >"$CLAUDE_SETTINGS"
+                say "Claude Code hooks added (backup: $CLAUDE_SETTINGS.keep-awake-backup)"
+            else
+                say "Could not read $CLAUDE_SETTINGS as JSON, so the hooks were not added"
+            fi
+        fi
+    fi
+fi
+
+# 5. Start SwiftBar or reload its plugins
 if swiftbar_running; then
     open -g "swiftbar://refreshallplugins"
 else
@@ -145,7 +215,8 @@ Done. The Keep Awake icon is in the menu bar, top right:
   moon          sleep is normal
   orange cup    Keep Awake is ON: the Mac won't sleep, even with the lid closed
   red cup       Keep Awake is ON and the Mac is running on battery
-Click the icon to switch.
+  ... A         the same, in Auto mode: Claude Code decides
+Click the icon to pick Off, On or Auto.
 
 Two more things:
   - Turn on "Launch at Login": click the icon, then SwiftBar > Preferences.
