@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> **This repository is archived.** Keep Awake moved to the SaltSquareIO organization: https://github.com/SaltSquareIO/mac-keep-awake (private to the organization, with a Backstage catalog entry and TechDocs). This copy stays public and read-only at its last version, so existing install links keep working, but it gets no further changes.
+
 # Keep Awake
 
 A menu bar icon for macOS that stops your Mac from sleeping, **including with the lid closed**, and shows you at a glance whether that's on.
